@@ -33,7 +33,18 @@ Rollback: `pm2 delete wa-multi` then start the old bot again (its folder is unto
 
 ## Commands (each user, in WhatsApp)
 `.vv` (reply to view-once → to you) · `.vvc` (→ into that chat) · `.ping` · `.help` ·
-`.ad status` · `.ad on|off [type]` · `.ad reset`
+`.ad status` · `.ad on|off [type]` · `.ad reset` ·
+`.block` / `.unblock` (reply to someone, send it in their chat, or add a number; `.block list`) ·
+`.transcribe` (reply to a voice note; needs a Gemini key on the admin page)
+
+Recovery counts are kept in `data/users/<id>/stats.json`, so they survive restarts.
+Statuses have two switches: **Deleted statuses** and **Edited statuses** (both off by default).
+
+## Updates (automatic)
+Push to `main` → GitHub Actions builds `wa-multi.tar.gz` (code + node_modules) as a release →
+the server's `scripts/auto-update.sh` (cron, every 5 min, as `ocarun`) installs it and restarts `wa-multi`.
+It rolls back by itself if the new version doesn't start. Needs a read-only GitHub token pasted on
+**Admin → System → Keys and updates**. Log: `data/auto-update.log`.
 
 ## Limits (change with environment variables)
 `MAX_USERS=30` · `MEDIA_MAX_MB=64` per file · `MEDIA_KEEP_HOURS=72` · `MEDIA_USER_CAP_MB=600` per user · `PORT=8080`

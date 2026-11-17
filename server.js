@@ -237,6 +237,27 @@ adm.post('/users/:id/:action', wrap(async (req, res) => {
 }));
 adm.get('/extras', (req, res) => res.json({ settings: adminSettings.get(), backups: backup.list(), last: backup.last() }));
 adm.post('/settings', (req, res) => res.json({ settings: adminSettings.set(req.body || {}) }));
+// Secrets the admin pastes in (Gemini key, GitHub update token). Saved as files in data/ (mode 600),
+// never shown again and never sent back to the browser - only whether each one is set.
+const KEY_FILES = { gemini: 'gemini.key', updateToken: 'update.token' };
+const keyPath = (k) => path.join(cfg.DATA_DIR, KEY_FILES[k]);
+function readTail(f, n) { try { return fs.readFileSync(f, 'utf8').trim().split('\n').slice(-n); } catch { return []; } }
+adm.get('/keys', (req, res) => {
+  const set = {}; for (const k of Object.keys(KEY_FILES)) set[k] = fs.existsSync(keyPath(k)) || (k === 'gemini' && !!process.env.GEMINI_API_KEY);
+  let release = null; try { release = fs.readFileSync(path.join(__dirname, '.release-tag'), 'utf8').trim(); } catch {}
+  res.json({ set, release, updateLog: readTail(path.join(cfg.DATA_DIR, 'auto-update.log'), 6) });
+});
+adm.post('/keys', (req, res) => {
+  for (const k of Object.keys(KEY_FILES)) {
+    const v = req.body?.[k];
+    if (typeof v !== 'string') continue;
+    const val = v.trim();
+    if (!val) { fs.rmSync(keyPath(k), { force: true }); continue; }
+    if (val.length > 300 || /\s/.test(val)) return res.status(400).json({ error: 'That key doesn\'t look right (no spaces, under 300 characters).' });
+    fs.writeFileSync(keyPath(k), val + '\n', { mode: 0o600 });
+  }
+  res.json({ ok: true });
+});
 adm.post('/backup', wrap(async (req, res) => {
   const r = await backup.run('manual');
   if (!r.ok) return res.status(500).json({ error: `Backup failed: ${r.error}` });

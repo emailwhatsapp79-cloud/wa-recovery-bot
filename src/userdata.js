@@ -40,7 +40,8 @@ const DEFAULTS = {
   sticker: true,
   document: true,
   viewOnce: true,    // try to auto-save view-once (WhatsApp often blocks this for linked devices; .vv always works)
-  statuses: false,   // recover deleted WhatsApp statuses (noisy, off by default)
+  statusDeleted: false, // recover WhatsApp statuses that get deleted (noisy, off by default)
+  statusEdited: false,  // show WhatsApp statuses that get edited, before and after (off by default)
   saveMediaAhead: true, // download media as it arrives so it can be resent after deletion
 };
 const KEYS = Object.keys(DEFAULTS);
@@ -58,7 +59,14 @@ const settingsCache = new Map();
 function loadSettings(uid) {
   if (!settingsCache.has(uid)) {
     const s = readJson(path.join(userDir(uid), 'settings.json'), {});
-    settingsCache.set(uid, { global: { ...DEFAULTS, ...(s.global || {}) }, chats: s.chats || {} });
+    const g = { ...DEFAULTS, ...(s.global || {}) };
+    // older versions had one "statuses" switch: carry it over to both new ones
+    if (typeof g.statuses === 'boolean') {
+      if (s.global.statusDeleted === undefined) g.statusDeleted = g.statuses;
+      if (s.global.statusEdited === undefined) g.statusEdited = g.statuses;
+      delete g.statuses;
+    }
+    settingsCache.set(uid, { global: g, chats: s.chats || {}, blocked: s.blocked || {} });
   }
   return settingsCache.get(uid);
 }
@@ -92,6 +100,34 @@ function resetChat(uid, chatId) {
   const s = loadSettings(uid); delete s.chats[chatId]; saveSettings(uid);
 }
 
+// ---------- blocked people (never recovered, anywhere) ----------
+// blocked: { "<jid>": { name, t } }. A person can be stored under their phone jid and/or hidden-ID (LID) jid.
+function blockedList(uid) { return loadSettings(uid).blocked; }
+function isBlocked(uid, ...jids) {
+  const b = loadSettings(uid).blocked;
+  return jids.some((j) => j && b[j]);
+}
+function block(uid, jids, name) {
+  const s = loadSettings(uid);
+  for (const j of jids.filter(Boolean)) s.blocked[j] = { name: name || '', t: Date.now() };
+  saveSettings(uid);
+}
+function unblock(uid, jids) {
+  const s = loadSettings(uid); let n = 0;
+  for (const j of jids.filter(Boolean)) if (s.blocked[j]) { delete s.blocked[j]; n++; }
+  saveSettings(uid); return n;
+}
+
+// ---------- recovery counts (kept across restarts) ----------
+const STATS_ZERO = { deleted: 0, edited: 0, viewOnce: 0, vv: 0, transcribed: 0, errors: 0 };
+function loadStats(uid) {
+  const s = readJson(path.join(userDir(uid), 'stats.json'), {});
+  return { ...STATS_ZERO, since: Date.now(), ...s };
+}
+function saveStats(uid, stats) {
+  try { writeJson(path.join(userDir(uid), 'stats.json'), stats); } catch {}
+}
+
 // ---------- activity / error log ----------
 // Kept in memory, flushed to disk at most every few seconds.
 const logs = new Map();
@@ -119,5 +155,6 @@ process.on('exit', flushLogs);
 module.exports = {
   USERS_DIR, userDir, authDir, mediaDir, removeUserData, removeAuth,
   DEFAULTS, KEYS, loadSettings, effective, setGlobal, setChat, resetChat,
+  blockedList, isBlocked, block, unblock, loadStats, saveStats,
   log, getLog, flushLogs,
 };

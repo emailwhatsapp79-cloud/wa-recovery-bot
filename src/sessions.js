@@ -9,7 +9,7 @@ const {
   Browsers, jidNormalizedUser, fetchLatestBaileysVersion,
 } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
-const { MSG_CACHE_PER_USER } = require('./config');
+const { MSG_CACHE_PER_USER, DATA_DIR } = require('./config');
 const ud = require('./userdata');
 const media = require('./media');
 const db = require('./db');
@@ -32,7 +32,7 @@ function extractText(m) {
   return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption ||
     m.videoMessage?.caption || m.documentMessage?.caption || null;
 }
-const CMD_RE = /^\.(vvc?|ping|help|ad|tag(all)?|menu)(\s|$)/i;
+const CMD_RE = /^\.(vvc?|ping|help|ad|tag(all)?|menu|block|unblock|transcribe|tr)(\s|$)/i;
 const isCommandText = (t) => !!t && CMD_RE.test(String(t).trim());
 const TEXT_CACHE_MAX = 3000, TEXT_CACHE_DAYS = 3;
 function typeOf(m) {
@@ -46,6 +46,33 @@ function isViewOnce(m) {
 }
 const num = (jid) => String(jid || '').split('@')[0].split(':')[0];
 const tsMs = (msg) => Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0) * 1000;
+
+// ---------- Gemini (voice-note transcription) ----------
+// The key comes from the GEMINI_API_KEY environment variable, or from data/gemini.key on the server.
+// It is never stored in the code or the repo.
+function geminiKey() {
+  if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY.trim();
+  try { return fs.readFileSync(require('path').join(DATA_DIR, 'gemini.key'), 'utf8').trim() || null; } catch { return null; }
+}
+async function geminiTranscribe(key, buf, mime) {
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+    signal: AbortSignal.timeout(90e3),
+    body: JSON.stringify({
+      contents: [{ parts: [
+        { text: 'Transcribe this voice note word for word, in the language it is spoken in. ' +
+                'If it is not in English, add an English translation after a line that says "English:". ' +
+                'Reply with only the transcript.' },
+        { inline_data: { mime_type: mime, data: buf.toString('base64') } },
+      ] }],
+    }),
+  });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(j.error?.message || `Gemini error ${res.status}`);
+  return (j.candidates?.[0]?.content?.parts || []).map((x) => x.text || '').join('').trim();
+}
 
 class Session {
   constructor(uid) {
@@ -68,7 +95,7 @@ class Session {
     this.names = new Map();   // jid -> last seen display name
     this.contacts = this.loadJson('contacts.json'); // names YOU saved in your phone, synced from WhatsApp
     this.lidMap = this.loadLidMap(); // WhatsApp hides numbers behind "LID" ids; this maps them back to phone numbers
-    this.stats = { deleted: 0, edited: 0, viewOnce: 0, vv: 0, errors: 0, since: Date.now() };
+    this.stats = ud.loadStats(uid); // all-time counts, kept in stats.json so they survive restarts
   }
 
   /** Text messages survive restarts, so an edit/delete right after a restart can still be recovered. */
@@ -94,6 +121,22 @@ class Session {
       const p = require('path').join(ud.userDir(this.uid), 'textcache.json');
       fs.writeFileSync(p + '.tmp', JSON.stringify(rows.slice(-TEXT_CACHE_MAX))); fs.renameSync(p + '.tmp', p);
     } catch {}
+  }
+
+  /** Add to a recovery count and save it to disk shortly after. */
+  bump(k, n = 1) {
+    this.stats[k] = (this.stats[k] || 0) + n;
+    if (this.statsSave) return;
+    this.statsSave = setTimeout(() => { this.statsSave = null; ud.saveStats(this.uid, this.stats); }, 5000);
+    this.statsSave.unref?.();
+  }
+  flushStats() { clearTimeout(this.statsSave); this.statsSave = null; ud.saveStats(this.uid, this.stats); }
+
+  /** Everyone you blocked with .block is ignored: nothing of theirs is saved or recovered. */
+  blocked(...jids) {
+    const all = [];
+    for (const j of jids) { if (!j) continue; const n = jidNormalizedUser(j); all.push(n); const pn = this.toPn(n); if (pn) all.push(pn); }
+    return ud.isBlocked(this.uid, ...all);
   }
 
   loadJson(f) {
@@ -175,7 +218,7 @@ class Session {
   log(level, msg) {
     ud.log(this.uid, level, msg);
     if (level !== 'error') return;
-    this.stats.errors++;
+    this.bump('errors');
     const now = Date.now();
     this.recentErrors = (this.recentErrors || []).filter((t) => now - t < 10 * 60e3);
     this.recentErrors.push(now);
@@ -329,7 +372,7 @@ class Session {
 
   async stop(reason = 'Stopped') {
     clearTimeout(this.timer); this.clearOffline();
-    clearTimeout(this.textSave); this.textSave = null; this.saveTextCache();
+    clearTimeout(this.textSave); this.textSave = null; this.saveTextCache(); this.flushStats();
     this.closeSocket();
     this.state = 'stopped'; this.qr = null; this.pairingCode = null;
     this.log('info', reason);
@@ -404,7 +447,8 @@ class Session {
 
     if (msg.key.fromMe) return; // don't cache or recover your own messages
     const cfg = ud.effective(this.uid, chatId);
-    if (!cfg.enabled || (isStatus && !cfg.statuses)) return;
+    if (!cfg.enabled || (isStatus && !cfg.statusDeleted && !cfg.statusEdited)) return;
+    if (this.blocked(msg.key.participant || chatId, msg.key.participantAlt, msg.key.participantPn, msg.key.senderPn, msg.key.remoteJidAlt)) return;
 
     // 3) remember the message so a later delete/edit can be recovered
     //    (skip other people's bot commands like .vv — their bot deletes those on purpose)
@@ -423,7 +467,7 @@ class Session {
         if (file) {
           entry.file = file;
           await this.sendFile(this.selfJid(), part, file, `👁️ *View-once ${part.type}*\nFrom: ${this.who(entry)}\nChat: ${await this.chatLabel(chatId)}`);
-          this.stats.viewOnce++;
+          this.bump('viewOnce');
           this.log('info', `Saved a view-once ${part.type} from ${this.who(entry)}`);
         }
       } catch (e) { this.log('warn', `View-once from ${this.who(entry)} could not be downloaded (${e.message}). Reply .vv to it.`); }
@@ -485,9 +529,11 @@ class Session {
     const cfg = ud.effective(this.uid, entry.chatId);
     const type = typeOf(entry.message);
     if (!cfg.enabled || cfg[type] === false) return;
+    if (entry.chatId === 'status@broadcast' && !cfg.statusDeleted) return;
+    if (this.blocked(entry.sender, entry.senderPn)) return;
     if (type === 'text' && isCommandText(extractText(entry.message))) return;
     this.handled.add(key);
-    const header = `🗑️ *Deleted ${type === 'text' ? 'message' : type}*\nFrom: ${this.who(entry)}\nChat: ${await this.chatLabel(entry.chatId)}`;
+    const header = `🗑️ *Deleted ${entry.chatId === 'status@broadcast' ? 'status' : type === 'text' ? 'message' : type}*\nFrom: ${this.who(entry)}\nChat: ${await this.chatLabel(entry.chatId)}`;
     try {
       const part = media.mediaPart(entry.message);
       if (!part) {
@@ -498,7 +544,7 @@ class Session {
         if (!file) throw new Error('file too large or unavailable');
         await this.sendFile(this.selfJid(), part, file, header + (part.node.caption ? `\n\n${part.node.caption}` : ''));
       }
-      this.stats.deleted++;
+      this.bump('deleted');
       this.log('info', `Recovered a deleted ${type} from ${this.who(entry)}`);
     } catch (e) {
       this.log('error', `Couldn't recover a deleted ${type} from ${this.who(entry)}: ${e.message}`);
@@ -510,6 +556,8 @@ class Session {
     const entry = this.cache.get(id);
     const cfg = ud.effective(this.uid, chatId);
     if (!cfg.enabled || !cfg.text) return;
+    if (chatId === 'status@broadcast' && !cfg.statusEdited) return;
+    if (this.blocked(entry?.sender, entry?.senderPn, meta.sender, meta.alt)) return;
     const after = extractText(newMsg) || '[non-text]';
     const key = 'edit:' + id + ':' + after;
     if (this.handled.has(key)) return;
@@ -523,11 +571,11 @@ class Session {
       : `*Now says:* ${after}\n_(The bot didn't see the original, so the old text isn't available.)_`;
     try {
       await this.sock.sendMessage(this.selfJid(), {
-        text: `✏️ *Edited message*\nFrom: ${from}\nChat: ${await this.chatLabel(entry ? entry.chatId : chatId)}\n\n${body}`,
+        text: `✏️ *Edited ${chatId === 'status@broadcast' ? 'status' : 'message'}*\nFrom: ${from}\nChat: ${await this.chatLabel(entry ? entry.chatId : chatId)}\n\n${body}`,
       });
       if (entry) entry.message = { conversation: after };
       else this.remember(id, { message: { conversation: after }, chatId, sender: meta.sender || chatId, senderPn: meta.alt, pushName: meta.pushName, t: Date.now(), file: null });
-      this.stats.edited++;
+      this.bump('edited');
       this.log('info', `Recovered an edit from ${from}${before === null ? ' (original not seen)' : ''}`);
     } catch (e) { this.log('error', `Couldn't send an edit: ${e.message}`); }
   }
@@ -544,11 +592,73 @@ class Session {
     return this.sock.sendMessage(to, { document: src, mimetype: part.node.mimetype || 'application/octet-stream', fileName: part.node.fileName || 'file', caption });
   }
 
+  // ---------- .block / .unblock ----------
+  async blockCommand(cmd, msg, chatId, args) {
+    const sub = (args[0] || '').toLowerCase();
+    if (cmd === '.block' && sub === 'list') {
+      const list = Object.entries(ud.blockedList(this.uid));
+      if (!list.length) return '🚫 *Blocked*\n\nNobody is blocked.';
+      const seen = new Set(); const lines = [];
+      for (const [j, v] of list) {
+        const pn = this.toPn(j) || j; if (seen.has(pn)) continue; seen.add(pn);
+        lines.push('• ' + this.person(pn, v.name));
+      }
+      return '🚫 *Blocked*\n_Nothing of theirs is recovered._\n\n' + lines.join('\n') + '\n\n_Undo with .unblock_';
+    }
+    // who: a typed number, else the person you replied to, else the person in this private chat
+    let target = null;
+    const digits = (args.join('') || '').replace(/\D/g, '');
+    const ctx = msg.message.extendedTextMessage?.contextInfo;
+    if (digits.length >= 8) target = `${digits}@s.whatsapp.net`;
+    else if (ctx?.participant) target = ctx.participant;
+    else if (ctx?.stanzaId && !chatId.endsWith('@g.us')) target = chatId;
+    else if (!chatId.endsWith('@g.us') && chatId !== 'status@broadcast' && !this.isSelf(chatId)) target = chatId;
+    if (!target) {
+      return `⚠️ *${cmd}*: tell me who.\n\n• Reply to their message with *${cmd}*\n• Or send *${cmd}* in your private chat with them\n• Or *${cmd} 2348012345678*` +
+        (chatId.endsWith('@g.us') ? '\n\n_To stop recovery for a whole group, use *.ad off* in it._' : '');
+    }
+    const n = jidNormalizedUser(target);
+    if (this.isSelf(n) || this.isSelf(this.toPn(n))) return '⚠️ You can\'t block yourself.';
+    const ids = [n, this.toPn(n)];
+    for (const [l, p] of this.lidMap) if (p === this.toPn(n)) ids.push(l); // also their hidden ID, if we know it
+    const label = this.person(n);
+    if (cmd === '.block') {
+      ud.block(this.uid, ids, this.contacts.get(this.toPn(n) || n)?.name || this.names.get(n) || '');
+      for (const [id, e] of this.cache) if (this.blocked(e.sender, e.senderPn)) this.cache.delete(id); // forget what we already kept
+      this.log('info', `Blocked ${label}`);
+      return `🚫 *Blocked* ${label}\n\nTheir deleted and edited messages, statuses and view-once won't be recovered anymore.\n_Undo with .unblock_`;
+    }
+    const removed = ud.unblock(this.uid, ids);
+    if (!removed) return `ℹ️ ${label} wasn't blocked.`;
+    this.log('info', `Unblocked ${label}`);
+    return `✅ *Unblocked* ${label}\n\nRecovery works for them again, from new messages on.`;
+  }
+
+  // ---------- .transcribe (Google Gemini, free tier) ----------
+  async transcribeCommand(msg, chatId) {
+    const ctx = msg.message.extendedTextMessage?.contextInfo;
+    const part = ctx?.quotedMessage ? media.mediaPart(ctx.quotedMessage) : null;
+    if (!part || !['audio', 'video'].includes(part.type)) return '📝 Reply to a voice note (or video) with *.transcribe* and its text comes here.';
+    const key = geminiKey();
+    if (!key) return '📝 *Transcription isn\'t switched on yet.*\nThe admin needs to add a free Gemini API key on the server.';
+    if (Number(part.node.fileLength || 0) > 15 * 1048576) return '⚠️ That one is too long to transcribe (over 15 MB).';
+    const file = await media.downloadToFile(this.uid, part.node, part.key, ctx.stanzaId, this.sock);
+    try {
+      const text = await geminiTranscribe(key, fs.readFileSync(file), (part.node.mimetype || 'audio/ogg').split(';')[0]);
+      const cached = this.cache.get(ctx.stanzaId);
+      const from = cached ? this.who(cached) : this.person(ctx.participant || chatId);
+      this.bump('transcribed');
+      this.log('info', `Transcribed a ${part.type} from ${from}`);
+      const secs = part.node.seconds ? ` · ${part.node.seconds}s` : '';
+      return `📝 *Transcript*${secs}\nFrom: ${from}\nChat: ${await this.chatLabel(chatId)}\n\n${text || '[No speech found]'}`;
+    } finally { fs.unlink(file, () => {}); }
+  }
+
   // ---------- commands (only messages YOU send) ----------
   async onCommand(msg, chatId, text) {
     const [cmdRaw, ...args] = text.split(/\s+/);
     const cmd = cmdRaw.toLowerCase();
-    const known = ['.vv', '.vvc', '.ping', '.help', '.ad', '.tag', '.tagall'];
+    const known = ['.vv', '.vvc', '.ping', '.help', '.ad', '.tag', '.tagall', '.block', '.unblock', '.transcribe', '.tr'];
     if (!known.includes(cmd)) return false;
     const toSelf = (t) => this.sock.sendMessage(this.selfJid(), { text: t });
     const deleteCmd = async () => { if (!this.isSelf(chatId)) { try { await this.sock.sendMessage(chatId, { delete: msg.key }); } catch {} } };
@@ -568,7 +678,7 @@ class Session {
           } else {
             await this.sendFile(chatId, part, file, part.node.caption || '');
           }
-          this.stats.vv++;
+          this.bump('vv');
           this.log('info', `${cmd} sent a ${part.type} ${cmd === '.vv' ? 'to you' : 'into the chat'}`);
           fs.unlink(file, () => {});
         }
@@ -582,10 +692,11 @@ class Session {
           '✅ *Bot is online*\n\n' +
           `📱 +${num(this.me)}\n` +
           `⏱️ Connected for ${h ? h + 'h ' : ''}${mi}m\n\n` +
-          '*Recovered since start*\n' +
+          '*Recovered in total*\n' +
           `🗑️ Deleted: ${this.stats.deleted}\n` +
           `✏️ Edited: ${this.stats.edited}\n` +
-          `👁️ View-once: ${this.stats.vv}`), deleteCmd()]);
+          `👁️ View-once: ${this.stats.vv + this.stats.viewOnce}\n` +
+          `📝 Transcribed: ${this.stats.transcribed || 0}`), deleteCmd()]);
         return true;
       }
       // .tag all [text]  -> mentions everyone and lists their names
@@ -615,6 +726,16 @@ class Session {
         await this.sock.sendMessage(chatId, { text: body, mentions: people }, quoted ? { quoted } : undefined);
         return true;
       }
+      if (cmd === '.block' || cmd === '.unblock') {
+        await deleteCmd();
+        await toSelf(await this.blockCommand(cmd, msg, chatId, args));
+        return true;
+      }
+      if (cmd === '.transcribe' || cmd === '.tr') {
+        await deleteCmd();
+        await toSelf(await this.transcribeCommand(msg, chatId));
+        return true;
+      }
       if (cmd === '.help') {
         await Promise.all([toSelf(
           '🤖 *WA Recovery commands*\n' +
@@ -632,6 +753,12 @@ class Session {
           '• *.tag all*  tag everyone, with their names listed\n' +
           '• *.tag your message*  notify everyone without the long list\n' +
           '   _reply to a message with .tag to tag everyone on it_\n\n' +
+          '*🚫 People*\n' +
+          '• *.block*  reply to someone (or send it in their chat) and nothing of theirs is recovered\n' +
+          '• *.block 2348012345678*  block by number\n' +
+          '• *.unblock*  same ways, to undo · *.block list*  see who is blocked\n\n' +
+          '*📝 Voice notes*\n' +
+          '• *.transcribe*  reply to a voice note and its text comes here\n\n' +
           '*🔧 Other*\n' +
           '• *.ping*  check the bot is online\n' +
           '• *.help*  show this list\n\n' +
@@ -650,7 +777,7 @@ class Session {
         } else if (a === 'reset') { ud.resetChat(this.uid, chatId); reply = `🔄 ${label} now uses your dashboard settings.`; }
         else {
           const c = ud.effective(this.uid, chatId);
-          const NAMES = {"enabled": "Recovery here", "text": "Text", "image": "Photos", "video": "Videos", "audio": "Voice notes", "sticker": "Stickers", "document": "Documents", "viewOnce": "View-once", "statuses": "Statuses", "saveMediaAhead": "Save media early"};
+          const NAMES = {"enabled": "Recovery here", "text": "Text", "image": "Photos", "video": "Videos", "audio": "Voice notes", "sticker": "Stickers", "document": "Documents", "viewOnce": "View-once", "statusDeleted": "Deleted statuses", "statusEdited": "Edited statuses", "saveMediaAhead": "Save media early"};
           reply = `⚙️ *Settings for ${label}*\n\n` + ud.KEYS.filter((k) => k !== 'privateChats' && k !== 'groups').map((k) => `${c[k] ? '✅' : '❌'} ${NAMES[k] || k}`).join('\n') + '\n\n_Change with .ad on / .ad off, or .ad reset_';
         }
         await Promise.all([toSelf(reply), deleteCmd()]); return true;

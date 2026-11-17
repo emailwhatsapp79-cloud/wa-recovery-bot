@@ -554,10 +554,12 @@ function dashboard(user) {
 <section class="screen" id="s-home">
   <h1>Home</h1><p class="lead">Your WhatsApp connection and what came back.</p>
   <div class="card" id="statusCard"><div class="hero-status st-wait" id="hero"><div class="pulse"><i></i></div><div><div class="big" id="stTitle">Loading…</div><div class="sub" id="stSub"></div></div></div><div id="linkArea"></div></div>
-  <div class="group"><h2>Recovered since the last restart</h2><div class="stat-grid four" id="stats"></div></div>
+  <div class="group"><h2>Recovered so far</h2><div class="stat-grid four" id="stats"></div></div>
   <div class="group"><h2>Commands you can send in WhatsApp</h2><div class="card" style="padding:4px 18px">
     <div class="cmd-row"><code>.vv</code><span>Reply to a view-once. It comes to your own chat.</span></div>
     <div class="cmd-row"><code>.vvc</code><span>Reply to a view-once. It's posted back in that chat.</span></div>
+    <div class="cmd-row"><code>.transcribe</code><span>Reply to a voice note. Its text comes to your own chat.</span></div>
+    <div class="cmd-row"><code>.block</code><span>Reply to someone. Nothing of theirs is recovered. <b>.unblock</b> undoes it.</span></div>
     <div class="cmd-row"><code>.ping</code><span>Check the bot is online.</span></div>
     <div class="cmd-row"><code>.ad</code><span>Turn recovery on or off for one chat. Send <b>.help</b> for everything.</span></div>
   </div></div>
@@ -594,7 +596,8 @@ function dashClient() {
     enabled: ['setWhere', 'Recovery', 'Master switch. Off pauses everything.'],
     privateChats: ['setWhere', 'Private chats', 'One-to-one chats'],
     groups: ['setWhere', 'Groups', 'All group chats'],
-    statuses: ['setWhere', 'Statuses', 'Deleted WhatsApp statuses'],
+    statusDeleted: ['setWhere', 'Deleted statuses', 'WhatsApp statuses someone deleted'],
+    statusEdited: ['setWhere', 'Edited statuses', 'WhatsApp statuses someone edited, before and after'],
     text: ['setWhat', 'Text', 'Deleted and edited messages'],
     image: ['setWhat', 'Photos', ''], video: ['setWhat', 'Videos', ''], audio: ['setWhat', 'Voice notes and audio', ''],
     sticker: ['setWhat', 'Stickers', ''], document: ['setWhat', 'Documents', ''],
@@ -723,13 +726,24 @@ function admin(user) {
 </section>
 
 <section class="screen" id="s-system">
-  <h1>System</h1><p class="lead">Alerts and backups.</p>
+  <h1>System</h1><p class="lead">Alerts, backups, keys and updates.</p>
   <div class="group"><h2>Alerts</h2><div class="rows" id="alertSet"></div>
   <p class="hint" style="margin:8px 4px 0">Sent from your WhatsApp to your own chat, at most once every 6 hours per problem.</p></div>
   <div class="group"><h2>Backups</h2><div class="rows" id="backupSet"></div>
   <p class="hint" style="margin:8px 4px 0">Once a day the server saves one file with every account, invite and WhatsApp login (not photos or videos). It replaces the previous one. If this server dies, that file moves everyone to a new server without relinking.</p>
   <button class="wide-btn" id="bkBtn">${icon('download')} Back up now</button><div class="err" id="bkMsg"></div>
   <div id="backups" style="margin-top:12px"></div></div>
+  <div class="group"><h2>Keys and updates</h2><div class="card" style="padding:16px 18px">
+    <label for="kGem" style="display:block;font-weight:600">Gemini API key <small id="kGemSt" class="muted"></small></label>
+    <p class="hint" style="margin:2px 0 8px">For <b>.transcribe</b>. Free from aistudio.google.com/apikey.</p>
+    <input id="kGem" type="password" autocomplete="off" placeholder="Paste to set or replace" style="width:100%">
+    <label for="kTok" style="display:block;font-weight:600;margin-top:14px">GitHub update token <small id="kTokSt" class="muted"></small></label>
+    <p class="hint" style="margin:2px 0 8px">Lets the server download new versions from your private repo by itself.</p>
+    <input id="kTok" type="password" autocomplete="off" placeholder="Paste to set or replace" style="width:100%">
+    <button class="wide-btn" id="kSave" style="margin-top:14px">Save keys</button><div class="err" id="kMsg"></div>
+    <p class="hint" style="margin:10px 0 0">Keys are stored only on this server and never shown again. Version: <b id="kRel">?</b></p>
+    <div id="kLog" class="hint" style="margin-top:6px;white-space:pre-wrap;font-family:ui-monospace,monospace;font-size:12.5px"></div>
+  </div></div>
 </section>`;
   return appLayout('Admin', user, tabs, screens, adminClient, 'overview');
 }
@@ -881,6 +895,19 @@ function adminClient() {
     try { const r = await api('/api/admin/backup', {}); toast(r.warning || ('Backup saved' + (r.sentToWhatsApp ? ' and sent to your WhatsApp' : ''))); } catch (err) { $('bkMsg').textContent = err.message; }
     b.disabled = false; loadExtras(); };
 
+  async function loadKeys() {
+    try { const k = await api('/api/admin/keys');
+      $('kGemSt').textContent = k.set.gemini ? '· set ✓' : '· not set'; $('kTokSt').textContent = k.set.updateToken ? '· set ✓' : '· not set';
+      $('kRel').textContent = k.release || 'manual install'; $('kLog').textContent = (k.updateLog || []).join('\n');
+    } catch (e) {}
+  }
+  $('kSave').onclick = async () => {
+    const body = {}; if ($('kGem').value.trim()) body.gemini = $('kGem').value; if ($('kTok').value.trim()) body.updateToken = $('kTok').value;
+    if (!Object.keys(body).length) { $('kMsg').textContent = 'Paste a key first.'; return; }
+    try { await api('/api/admin/keys', body); $('kGem').value = ''; $('kTok').value = ''; $('kMsg').textContent = ''; toast('Keys saved'); loadKeys(); }
+    catch (err) { $('kMsg').textContent = err.message; }
+  };
+  loadKeys();
   async function load() { try { data = await api('/api/admin/overview'); } catch (e) { return; } renderOverview(); renderUsers(); renderInvites(); }
   load(); loadExtras(); setInterval(load, 10000);
 }
