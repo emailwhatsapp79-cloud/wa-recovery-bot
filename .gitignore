@@ -1,0 +1,8 @@
+node_modules/
+data/
+auth_info*/
+*.tar.gz
+*.tgz
+.env
+*.pem
+*.key
