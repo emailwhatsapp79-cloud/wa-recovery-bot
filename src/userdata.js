@@ -66,7 +66,7 @@ function loadSettings(uid) {
       if (s.global.statusEdited === undefined) g.statusEdited = g.statuses;
       delete g.statuses;
     }
-    settingsCache.set(uid, { global: g, chats: s.chats || {}, blocked: s.blocked || {} });
+    settingsCache.set(uid, { global: g, chats: s.chats || {}, blocks: s.blocks || {} });
   }
   return settingsCache.get(uid);
 }
@@ -100,22 +100,13 @@ function resetChat(uid, chatId) {
   const s = loadSettings(uid); delete s.chats[chatId]; saveSettings(uid);
 }
 
-// ---------- blocked people (never recovered, anywhere) ----------
-// blocked: { "<jid>": { name, t } }. A person can be stored under their phone jid and/or hidden-ID (LID) jid.
-function blockedList(uid) { return loadSettings(uid).blocked; }
-function isBlocked(uid, ...jids) {
-  const b = loadSettings(uid).blocked;
-  return jids.some((j) => j && b[j]);
-}
-function block(uid, jids, name) {
-  const s = loadSettings(uid);
-  for (const j of jids.filter(Boolean)) s.blocked[j] = { name: name || '', t: Date.now() };
-  saveSettings(uid);
-}
-function unblock(uid, jids) {
-  const s = loadSettings(uid); let n = 0;
-  for (const j of jids.filter(Boolean)) if (s.blocked[j]) { delete s.blocked[j]; n++; }
-  saveSettings(uid); return n;
+// ---------- timed WhatsApp blocks (.block) ----------
+// blocks: { "<jid>": { name, until, t } }  until = time to unblock (ms), or null = until .unblock
+function listBlocks(uid) { return loadSettings(uid).blocks; }
+function setBlock(uid, jid, info) { loadSettings(uid).blocks[jid] = { ...info, t: Date.now() }; saveSettings(uid); }
+function removeBlock(uid, jid) {
+  const b = loadSettings(uid).blocks; if (!b[jid]) return false;
+  delete b[jid]; saveSettings(uid); return true;
 }
 
 // ---------- recovery counts (kept across restarts) ----------
@@ -155,6 +146,6 @@ process.on('exit', flushLogs);
 module.exports = {
   USERS_DIR, userDir, authDir, mediaDir, removeUserData, removeAuth,
   DEFAULTS, KEYS, loadSettings, effective, setGlobal, setChat, resetChat,
-  blockedList, isBlocked, block, unblock, loadStats, saveStats,
+  listBlocks, setBlock, removeBlock, loadStats, saveStats,
   log, getLog, flushLogs,
 };

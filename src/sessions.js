@@ -47,6 +47,23 @@ function isViewOnce(m) {
 const num = (jid) => String(jid || '').split('@')[0].split(':')[0];
 const tsMs = (msg) => Number(msg.messageTimestamp?.toNumber?.() ?? msg.messageTimestamp ?? 0) * 1000;
 
+// ---------- durations for .block ----------
+const UNITS = { m: 60e3, min: 60e3, mins: 60e3, h: 3600e3, hr: 3600e3, hrs: 3600e3, d: 864e5, day: 864e5, days: 864e5, w: 6048e5, wk: 6048e5 };
+/** "30m" / "2h" / "1d" / "1w" -> milliseconds, or null if it isn't a duration. Max 1 year. */
+function parseDuration(t) {
+  const m = /^(\d{1,4})(m|min|mins|h|hr|hrs|d|day|days|w|wk)$/i.exec(String(t || '').trim());
+  if (!m) return null;
+  const ms = Number(m[1]) * UNITS[m[2].toLowerCase()];
+  return ms > 0 && ms <= 366 * 864e5 ? ms : null;
+}
+/** 5400000 -> "1h 30m" */
+function left(ms) {
+  const total = Math.max(1, Math.ceil(Math.max(0, ms) / 60e3)); // whole minutes, rounded up
+  const d = Math.floor(total / 1440), h = Math.floor(total / 60) % 24, m = total % 60;
+  return [d && d + 'd', h && h + 'h', m && m + 'm'].filter(Boolean).join(' ');
+}
+const when = (t) => new Date(t).toLocaleString('en-GB', { timeZone: process.env.TZ_DISPLAY || 'Africa/Lagos', weekday: 'short', hour: '2-digit', minute: '2-digit' });
+
 // ---------- Gemini (voice-note transcription) ----------
 // The key comes from the GEMINI_API_KEY environment variable, or from data/gemini.key on the server.
 // It is never stored in the code or the repo.
@@ -131,13 +148,6 @@ class Session {
     this.statsSave.unref?.();
   }
   flushStats() { clearTimeout(this.statsSave); this.statsSave = null; ud.saveStats(this.uid, this.stats); }
-
-  /** Everyone you blocked with .block is ignored: nothing of theirs is saved or recovered. */
-  blocked(...jids) {
-    const all = [];
-    for (const j of jids) { if (!j) continue; const n = jidNormalizedUser(j); all.push(n); const pn = this.toPn(n); if (pn) all.push(pn); }
-    return ud.isBlocked(this.uid, ...all);
-  }
 
   loadJson(f) {
     try { return new Map(Object.entries(JSON.parse(fs.readFileSync(require('path').join(ud.userDir(this.uid), f), 'utf8')))); }
@@ -314,6 +324,7 @@ class Session {
         db.updateUser(this.uid, { phone: num(this.me) });
         this.log('info', `Connected as +${num(this.me)}`);
         this.clearOffline();
+        this.startBlockTimer();
         alerts.notify(this.uid, 'back_online').catch(() => {});
       }
       if (connection === 'close') {
@@ -372,7 +383,7 @@ class Session {
 
   async stop(reason = 'Stopped') {
     clearTimeout(this.timer); this.clearOffline();
-    clearTimeout(this.textSave); this.textSave = null; this.saveTextCache(); this.flushStats();
+    clearTimeout(this.textSave); this.textSave = null; this.saveTextCache(); this.flushStats(); clearInterval(this.blockTimer);
     this.closeSocket();
     this.state = 'stopped'; this.qr = null; this.pairingCode = null;
     this.log('info', reason);
@@ -448,7 +459,6 @@ class Session {
     if (msg.key.fromMe) return; // don't cache or recover your own messages
     const cfg = ud.effective(this.uid, chatId);
     if (!cfg.enabled || (isStatus && !cfg.statusDeleted && !cfg.statusEdited)) return;
-    if (this.blocked(msg.key.participant || chatId, msg.key.participantAlt, msg.key.participantPn, msg.key.senderPn, msg.key.remoteJidAlt)) return;
 
     // 3) remember the message so a later delete/edit can be recovered
     //    (skip other people's bot commands like .vv — their bot deletes those on purpose)
@@ -530,7 +540,6 @@ class Session {
     const type = typeOf(entry.message);
     if (!cfg.enabled || cfg[type] === false) return;
     if (entry.chatId === 'status@broadcast' && !cfg.statusDeleted) return;
-    if (this.blocked(entry.sender, entry.senderPn)) return;
     if (type === 'text' && isCommandText(extractText(entry.message))) return;
     this.handled.add(key);
     const header = `🗑️ *Deleted ${entry.chatId === 'status@broadcast' ? 'status' : type === 'text' ? 'message' : type}*\nFrom: ${this.who(entry)}\nChat: ${await this.chatLabel(entry.chatId)}`;
@@ -557,7 +566,6 @@ class Session {
     const cfg = ud.effective(this.uid, chatId);
     if (!cfg.enabled || !cfg.text) return;
     if (chatId === 'status@broadcast' && !cfg.statusEdited) return;
-    if (this.blocked(entry?.sender, entry?.senderPn, meta.sender, meta.alt)) return;
     const after = extractText(newMsg) || '[non-text]';
     const key = 'edit:' + id + ':' + after;
     if (this.handled.has(key)) return;
@@ -592,46 +600,68 @@ class Session {
     return this.sock.sendMessage(to, { document: src, mimetype: part.node.mimetype || 'application/octet-stream', fileName: part.node.fileName || 'file', caption });
   }
 
-  // ---------- .block / .unblock ----------
+  // ---------- .block / .unblock (real WhatsApp block, optionally for a set time) ----------
   async blockCommand(cmd, msg, chatId, args) {
     const sub = (args[0] || '').toLowerCase();
     if (cmd === '.block' && sub === 'list') {
-      const list = Object.entries(ud.blockedList(this.uid));
-      if (!list.length) return '🚫 *Blocked*\n\nNobody is blocked.';
-      const seen = new Set(); const lines = [];
-      for (const [j, v] of list) {
-        const pn = this.toPn(j) || j; if (seen.has(pn)) continue; seen.add(pn);
-        lines.push('• ' + this.person(pn, v.name));
-      }
-      return '🚫 *Blocked*\n_Nothing of theirs is recovered._\n\n' + lines.join('\n') + '\n\n_Undo with .unblock_';
+      const list = Object.entries(ud.listBlocks(this.uid));
+      if (!list.length) return '🚫 *Blocked by the bot*\n\nNobody right now.';
+      return '🚫 *Blocked by the bot*\n\n' + list.map(([j, b]) => `• ${this.person(j, b.name)}\n   ${b.until ? '⏳ ' + left(b.until - Date.now()) + ' left' : '♾️ until you .unblock'}`).join('\n') +
+        '\n\n_Unblock early with .unblock_';
+    }
+    // how long: last word like 30m, 2h, 1d, 1w (optional)
+    let ms = null; const rest = [...args];
+    if (rest.length && parseDuration(rest[rest.length - 1]) !== null) ms = parseDuration(rest.pop());
+    else if (rest.length && /^\d+(m|min|mins|h|hr|hrs|d|day|days|w|wk)?$/i.test(rest[rest.length - 1]) && rest[rest.length - 1].replace(/\D/g, '').length < 6) {
+      return '⚠️ I didn\'t understand that time. Use for example *30m*, *2h*, *1d* or *1w* (max 1 year).';
     }
     // who: a typed number, else the person you replied to, else the person in this private chat
     let target = null;
-    const digits = (args.join('') || '').replace(/\D/g, '');
+    const digits = rest.join('').replace(/\D/g, '');
     const ctx = msg.message.extendedTextMessage?.contextInfo;
     if (digits.length >= 8) target = `${digits}@s.whatsapp.net`;
     else if (ctx?.participant) target = ctx.participant;
-    else if (ctx?.stanzaId && !chatId.endsWith('@g.us')) target = chatId;
     else if (!chatId.endsWith('@g.us') && chatId !== 'status@broadcast' && !this.isSelf(chatId)) target = chatId;
     if (!target) {
-      return `⚠️ *${cmd}*: tell me who.\n\n• Reply to their message with *${cmd}*\n• Or send *${cmd}* in your private chat with them\n• Or *${cmd} 2348012345678*` +
-        (chatId.endsWith('@g.us') ? '\n\n_To stop recovery for a whole group, use *.ad off* in it._' : '');
+      return `⚠️ *${cmd}*: tell me who.\n\n• Reply to their message with *${cmd === '.block' ? '.block 2h' : cmd}*\n• Or send it in your chat with them\n• Or *${cmd} 2348012345678${cmd === '.block' ? ' 2h' : ''}*` +
+        (cmd === '.block' ? '\n\n_Time is optional: 30m, 2h, 1d, 1w. Without it they stay blocked until .unblock._' : '');
     }
     const n = jidNormalizedUser(target);
-    if (this.isSelf(n) || this.isSelf(this.toPn(n))) return '⚠️ You can\'t block yourself.';
-    const ids = [n, this.toPn(n)];
-    for (const [l, p] of this.lidMap) if (p === this.toPn(n)) ids.push(l); // also their hidden ID, if we know it
-    const label = this.person(n);
+    const jid = this.toPn(n) || n; // block by phone number when we know it
+    if (this.isSelf(n) || this.isSelf(jid)) return '⚠️ You can\'t block yourself.';
+    const label = this.person(jid);
     if (cmd === '.block') {
-      ud.block(this.uid, ids, this.contacts.get(this.toPn(n) || n)?.name || this.names.get(n) || '');
-      for (const [id, e] of this.cache) if (this.blocked(e.sender, e.senderPn)) this.cache.delete(id); // forget what we already kept
-      this.log('info', `Blocked ${label}`);
-      return `🚫 *Blocked* ${label}\n\nTheir deleted and edited messages, statuses and view-once won't be recovered anymore.\n_Undo with .unblock_`;
+      await this.sock.updateBlockStatus(jid, 'block');
+      const until = ms ? Date.now() + ms : null;
+      ud.setBlock(this.uid, jid, { name: this.contacts.get(jid)?.name || this.names.get(jid) || this.names.get(n) || '', until });
+      this.log('info', `Blocked ${label}${ms ? ' for ' + left(ms) : ''}`);
+      return `🚫 *Blocked* ${label}\n\n` + (ms ? `⏳ For ${left(ms)}. I'll unblock them at ${when(until)} and tell you here.` : '♾️ Until you send *.unblock*.');
     }
-    const removed = ud.unblock(this.uid, ids);
-    if (!removed) return `ℹ️ ${label} wasn't blocked.`;
+    await this.sock.updateBlockStatus(jid, 'unblock');
+    const had = ud.removeBlock(this.uid, jid) || ud.removeBlock(this.uid, n);
     this.log('info', `Unblocked ${label}`);
-    return `✅ *Unblocked* ${label}\n\nRecovery works for them again, from new messages on.`;
+    return `✅ *Unblocked* ${label}` + (had ? '' : '\n_(They weren\'t on the bot\'s block list, but they\'re unblocked now.)_');
+  }
+
+  /** Every 30 s: unblock anyone whose time is up (also catches ones that expired while the bot was offline). */
+  startBlockTimer() {
+    clearInterval(this.blockTimer);
+    const tick = async () => {
+      if (this.state !== 'connected' || !this.sock) return;
+      for (const [jid, b] of Object.entries(ud.listBlocks(this.uid))) {
+        if (!b.until || b.until > Date.now()) continue;
+        try {
+          await this.sock.updateBlockStatus(jid, 'unblock');
+          ud.removeBlock(this.uid, jid);
+          const who = this.person(jid, b.name);
+          this.log('info', `Time's up: unblocked ${who}`);
+          await this.sock.sendMessage(this.selfJid(), { text: `⏰ *Time's up*\n\nUnblocked ${who}.` });
+        } catch (e) { this.log('warn', `Couldn't unblock ${this.person(jid, b.name)} yet (${e.message}). Will retry.`); }
+      }
+    };
+    this.blockTimer = setInterval(() => tick().catch(() => {}), 30e3);
+    this.blockTimer.unref?.();
+    setTimeout(() => tick().catch(() => {}), 5e3).unref?.();
   }
 
   // ---------- .transcribe (Google Gemini, free tier) ----------
@@ -753,10 +783,11 @@ class Session {
           '• *.tag all*  tag everyone, with their names listed\n' +
           '• *.tag your message*  notify everyone without the long list\n' +
           '   _reply to a message with .tag to tag everyone on it_\n\n' +
-          '*🚫 People*\n' +
-          '• *.block*  reply to someone (or send it in their chat) and nothing of theirs is recovered\n' +
-          '• *.block 2348012345678*  block by number\n' +
-          '• *.unblock*  same ways, to undo · *.block list*  see who is blocked\n\n' +
+          '*🚫 Block for a while*\n' +
+          '• *.block 2h*  reply to someone (or send it in their chat): blocked on WhatsApp, unblocked by itself after 2h\n' +
+          '   _times: 30m, 2h, 1d, 1w · no time = until you .unblock_\n' +
+          '• *.block 2348012345678 1d*  block by number\n' +
+          '• *.unblock*  unblock now · *.block list*  who is blocked, time left\n\n' +
           '*📝 Voice notes*\n' +
           '• *.transcribe*  reply to a voice note and its text comes here\n\n' +
           '*🔧 Other*\n' +
@@ -815,4 +846,4 @@ async function remove(uid) {
 }
 function all() { return sessions; }
 
-module.exports = { get, startAll, remove, all, hasAuth, Session, _helpers: { extractText, typeOf, isViewOnce } };
+module.exports = { get, startAll, remove, all, hasAuth, Session, _helpers: { extractText, typeOf, isViewOnce, parseDuration, left } };

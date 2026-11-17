@@ -559,7 +559,7 @@ function dashboard(user) {
     <div class="cmd-row"><code>.vv</code><span>Reply to a view-once. It comes to your own chat.</span></div>
     <div class="cmd-row"><code>.vvc</code><span>Reply to a view-once. It's posted back in that chat.</span></div>
     <div class="cmd-row"><code>.transcribe</code><span>Reply to a voice note. Its text comes to your own chat.</span></div>
-    <div class="cmd-row"><code>.block</code><span>Reply to someone. Nothing of theirs is recovered. <b>.unblock</b> undoes it.</span></div>
+    <div class="cmd-row"><code>.block 2h</code><span>Reply to someone. Blocked on WhatsApp, unblocked by itself after 2h (30m, 1d, 1w…). <b>.unblock</b> ends it early.</span></div>
     <div class="cmd-row"><code>.ping</code><span>Check the bot is online.</span></div>
     <div class="cmd-row"><code>.ad</code><span>Turn recovery on or off for one chat. Send <b>.help</b> for everything.</span></div>
   </div></div>
