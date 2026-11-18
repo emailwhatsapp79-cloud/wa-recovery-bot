@@ -686,67 +686,24 @@ class Session {
     setTimeout(() => tick().catch(() => {}), 5e3).unref?.();
   }
 
-  // ---------- .admins: privately message a group's admins ----------
-  // In a group you can type in:   .admins <message>   (reply to someone to say who it's about)
-  // From your own chat (works for locked groups):   .admins <group name> | <message>
-  // .admins <group name>  (no message) lists that group's admins.
+  // ---------- .admins: tag only the group's admins ----------
+  // .admins <anything>  ->  posts your text in the group with every admin @tagged (like .tag, admins only).
+  // Reply to a message with it to tag them on that message.
   async adminsCommand(msg, chatId, text) {
-    const body = text.replace(/^\.admins\b/i, '').trim();
-    const ctx = msg.message.extendedTextMessage?.contextInfo;
-    let groupId = null, request = body;
-    if (chatId.endsWith('@g.us')) {
-      groupId = chatId;
-    } else {
-      const [name, ...restParts] = body.split('|');
-      const q = name.trim().toLowerCase();
-      request = restParts.join('|').trim();
-      if (!q) return '👥 *.admins*\n\nFrom here: *.admins Group name | your message*\nIn a group you can type in: reply to someone with *.admins your message*\n\n_.admins Group name_ on its own lists the admins.';
-      const groups = Object.values(await this.allGroups());
-      const exact = groups.filter((g) => (g.subject || '').trim().toLowerCase() === q);
-      const found = exact.length ? exact : groups.filter((g) => (g.subject || '').toLowerCase().includes(q));
-      if (!found.length) return `⚠️ No group of yours matches "${name.trim()}".`;
-      if (found.length > 1) return `⚠️ "${name.trim()}" matches ${found.length} groups:\n\n` + found.slice(0, 10).map((g) => '• ' + g.subject).join('\n') + '\n\n_Type more of the name._';
-      groupId = found[0].id;
-    }
-    const meta = await this.sock.groupMetadata(groupId);
-    this.groupNames.set(groupId, meta.subject);
-    const pnOf = (p) => (p.phoneNumber && p.phoneNumber.endsWith('@s.whatsapp.net') ? jidNormalizedUser(p.phoneNumber) : this.toPn(p.id)) || jidNormalizedUser(p.id);
-    const admins = meta.participants.filter((p) => p.admin);
-    const meAdmin = admins.some((p) => this.isSelf(jidNormalizedUser(p.id)) || this.isSelf(pnOf(p)));
-    const others = admins.filter((p) => !this.isSelf(jidNormalizedUser(p.id)) && !this.isSelf(pnOf(p)));
-    const names = others.map((p) => this.person(pnOf(p)));
-    if (!request) {
-      return `👥 *Admins of ${meta.subject}*${meta.announce ? '  🔒 locked' : ''}\n\n` + (names.length ? names.map((n) => '• ' + n).join('\n') : 'No other admins.') +
-        (meAdmin ? '\n\n_You are an admin here too._' : '') + `\n\n_Message them: .admins ${meta.subject} | your message_`;
-    }
-    if (!others.length) return meAdmin ? '⚠️ You\'re the only admin of that group.' : '⚠️ That group has no admins I can message.';
+    if (!chatId.endsWith('@g.us')) return { self: '⚠️ *.admins* only works inside a group.' };
     this.adminsCooldown ||= new Map();
-    const last = this.adminsCooldown.get(groupId) || 0;
-    if (Date.now() - last < 10 * 60e3) return `⏳ You messaged the admins of ${meta.subject} less than 10 minutes ago. Try again in ${Math.ceil((10 * 60e3 - (Date.now() - last)) / 60e3)} min.`;
-    // who/what it's about: the message you replied to (only possible in a group you can type in)
-    let about = '';
-    if (ctx?.quotedMessage && ctx.participant) {
-      const quoted = extractText(ctx.quotedMessage) || (media.mediaPart(ctx.quotedMessage) ? `[${media.mediaPart(ctx.quotedMessage).type}]` : '');
-      about = `\n\n*About:* ${this.person(ctx.participant)}` + (quoted ? `\n💬 "${quoted.slice(0, 300)}"` : '');
-    }
-    const note = `👋 *To the admins of ${meta.subject}*\n\n${request.slice(0, 1000)}${about}`;
-    const targets = others.slice(0, 10);
-    this.adminsCooldown.set(groupId, Date.now());
-    let ok = 0; const failed = [];
-    for (const p of targets) {
-      try { await this.sock.sendMessage(pnOf(p), { text: note }); ok++; } catch (e) { failed.push(this.person(pnOf(p))); }
-      await new Promise((r) => setTimeout(r, 1500)); // gentle pace so WhatsApp doesn't see a burst
-    }
-    this.log('info', `Messaged ${ok} admin(s) of ${meta.subject}`);
-    return `✅ *Sent to ${ok} admin${ok === 1 ? '' : 's'} of ${meta.subject}*\n\n` + targets.filter((p) => !failed.includes(this.person(pnOf(p)))).map((p) => '• ' + this.person(pnOf(p))).join('\n') +
-      (failed.length ? `\n\n⚠️ Couldn't reach: ${failed.join(', ')}` : '') + (others.length > 10 ? `\n\n_Only the first 10 of ${others.length} admins were messaged._` : '');
-  }
-  async allGroups() {
-    if (this.groupsCache && Date.now() - this.groupsCache.t < 10 * 60e3) return this.groupsCache.list;
-    const list = await this.sock.groupFetchAllParticipating();
-    this.groupsCache = { t: Date.now(), list };
-    for (const g of Object.values(list)) this.groupNames.set(g.id, g.subject);
-    return list;
+    const last = this.adminsCooldown.get(chatId) || 0;
+    if (Date.now() - last < 60e3) return { self: '⏳ *.admins* was used in that group less than a minute ago. Try again shortly.' };
+    const meta = await this.sock.groupMetadata(chatId);
+    const mine = new Set([this.me, this.meLid].filter(Boolean).map((j) => num(j)));
+    const admins = meta.participants.filter((p) => p.admin && !mine.has(num(p.id)) && !mine.has(num(p.phoneNumber))).map((p) => p.id);
+    if (!admins.length) return { self: '⚠️ That group has no other admins to tag.' };
+    this.adminsCooldown.set(chatId, Date.now());
+    const note = text.replace(/^\.admins\b/i, '').trim();
+    const tags = admins.map((j) => '@' + j.split('@')[0]).join(' ');
+    const ctx = msg.message.extendedTextMessage?.contextInfo;
+    const quoted = ctx?.quotedMessage ? { key: { remoteJid: chatId, id: ctx.stanzaId, participant: ctx.participant, fromMe: false }, message: ctx.quotedMessage } : undefined;
+    return { group: { text: (note || '📢 Admins, please see this.') + '\n\n' + tags, mentions: admins }, quoted };
   }
 
   // ---------- .transcribe (Google Gemini, free tier) ----------
@@ -845,8 +802,10 @@ class Session {
         return true;
       }
       if (cmd === '.admins') {
+        const r = await this.adminsCommand(msg, chatId, text);
         await deleteCmd();
-        await toSelf(await this.adminsCommand(msg, chatId, text));
+        if (r.self) await toSelf(r.self);
+        else await this.sock.sendMessage(chatId, r.group, r.quoted ? { quoted: r.quoted } : undefined);
         return true;
       }
       if (cmd === '.transcribe' || cmd === '.tr') {
@@ -877,9 +836,8 @@ class Session {
           '• *.block 2348012345678 1d*  block by number\n' +
           '• *.unblock*  unblock now · *.block list*  who is blocked, time left\n\n' +
           '*👥 Group admins*\n' +
-          '• *.admins Group name | message*  send it from here; works even if the group is locked\n' +
-          '• *.admins message*  in a group, reply to someone: admins get it privately, with who it\'s about\n' +
-          '• *.admins Group name*  list its admins\n\n' +
+          '• *.admins your message*  posts it in the group with all the admins tagged\n' +
+          '   _reply to a message with it to tag them on that message_\n\n' +
           '*📝 Voice notes*\n' +
           '• *.transcribe*  reply to a voice note and its text comes here\n\n' +
           '*🔧 Other*\n' +

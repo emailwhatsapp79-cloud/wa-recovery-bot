@@ -35,7 +35,7 @@ Rollback: `pm2 delete wa-multi` then start the old bot again (its folder is unto
 `.vv` (reply to view-once → to you) · `.vvc` (→ into that chat) · `.ping` · `.help` ·
 `.ad status` · `.ad on|off [type]` · `.ad reset` ·
 `.block [30m|2h|1d|1w]` (blocks on WhatsApp, unblocks by itself when the time is up; reply to someone, send it in their chat, or add a number) · `.unblock` · `.block list` ·
-`.admins Group name | message` (privately messages that group's admins; also `.admins message` as a reply inside a group) ·
+`.admins message` (in a group: posts it with only the admins tagged) ·
 `.transcribe` (reply to a voice note; needs a Gemini key on the admin page)
 
 Recovery counts are kept in `data/users/<id>/stats.json`, so they survive restarts.
