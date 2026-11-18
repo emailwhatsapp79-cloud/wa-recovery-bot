@@ -588,16 +588,38 @@ class Session {
     } catch (e) { this.log('error', `Couldn't send an edit: ${e.message}`); }
   }
 
-  async sendFile(to, part, file, caption) {
+  async sendFile(to, part, file, caption, mentions) {
     const src = { url: file };
-    if (part.type === 'image') return this.sock.sendMessage(to, { image: src, caption });
-    if (part.type === 'video') return this.sock.sendMessage(to, { video: src, caption });
-    if (part.type === 'sticker') { await this.sock.sendMessage(to, { sticker: src }); return caption && this.sock.sendMessage(to, { text: caption }); }
+    const m = mentions?.length ? { mentions } : {};
+    if (part.type === 'image') return this.sock.sendMessage(to, { image: src, caption, ...m });
+    if (part.type === 'video') return this.sock.sendMessage(to, { video: src, caption, ...m });
+    if (part.type === 'sticker') { await this.sock.sendMessage(to, { sticker: src }); return caption && this.sock.sendMessage(to, { text: caption, ...m }); }
     if (part.type === 'audio') {
       await this.sock.sendMessage(to, { audio: src, mimetype: part.node.mimetype || 'audio/ogg; codecs=opus', ptt: !!part.node.ptt });
-      return caption && this.sock.sendMessage(to, { text: caption });
+      return caption && this.sock.sendMessage(to, { text: caption, ...m });
     }
-    return this.sock.sendMessage(to, { document: src, mimetype: part.node.mimetype || 'application/octet-stream', fileName: part.node.fileName || 'file', caption });
+    return this.sock.sendMessage(to, { document: src, mimetype: part.node.mimetype || 'application/octet-stream', fileName: part.node.fileName || 'file', caption, ...m });
+  }
+
+  /**
+   * Caption for a view-once that .vv / .vvc sends.
+   * inChat = true (.vvc): goes back into the chat, so the sender is @mentioned instead of showing their number.
+   */
+  async viewOnceCaption(part, { senderJid, cached, chatId, inChat }) {
+    const kind = { image: 'photo', video: 'video', audio: 'voice note' }[part.type] || part.type;
+    const lines = [`👁️ *View-once ${kind}*`];
+    const mentions = [];
+    if (inChat && senderJid && !this.isSelf(senderJid)) {
+      const j = jidNormalizedUser(senderJid);
+      lines.push(`From: @${j.split('@')[0]}`); mentions.push(j);
+    } else {
+      lines.push(`From: ${cached ? this.who(cached) : this.person(senderJid || chatId)}`);
+    }
+    if (!inChat) lines.push(`Chat: ${await this.chatLabel(chatId)}`);
+    if (cached?.t) lines.push(`Sent: ${when(cached.t)}`);
+    if (part.node.seconds && part.type !== 'image') lines.push(`Length: ${part.node.seconds}s`);
+    if (part.node.caption) lines.push('', `💬 ${part.node.caption}`);
+    return { caption: lines.join('\n'), mentions };
   }
 
   // ---------- .block / .unblock (real WhatsApp block, optionally for a set time) ----------
@@ -702,12 +724,10 @@ class Session {
         } else {
           const file = await media.downloadToFile(this.uid, part.node, part.key, ctx.stanzaId, this.sock);
           const cached = this.cache.get(ctx.stanzaId);
-          const from = cached ? this.who(cached) : this.person(ctx.participant || chatId);
-          if (cmd === '.vv') {
-            await this.sendFile(this.selfJid(), part, file, `👁️ View-once from ${from}\n${chatId.endsWith('@g.us') ? 'Group: ' + await this.chatLabel(chatId) : ''}${part.node.caption ? '\n\n' + part.node.caption : ''}`);
-          } else {
-            await this.sendFile(chatId, part, file, part.node.caption || '');
-          }
+          const senderJid = ctx.participant || (chatId.endsWith('@g.us') ? null : chatId);
+          const inChat = cmd === '.vvc';
+          const { caption, mentions } = await this.viewOnceCaption(part, { senderJid, cached, chatId, inChat });
+          await this.sendFile(inChat ? chatId : this.selfJid(), part, file, caption, mentions);
           this.bump('vv');
           this.log('info', `${cmd} sent a ${part.type} ${cmd === '.vv' ? 'to you' : 'into the chat'}`);
           fs.unlink(file, () => {});
