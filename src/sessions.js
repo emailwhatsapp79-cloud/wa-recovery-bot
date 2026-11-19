@@ -6,7 +6,7 @@ const fs = require('fs');
 const pino = require('pino');
 const {
   default: makeWASocket, DisconnectReason, useMultiFileAuthState, makeCacheableSignalKeyStore,
-  Browsers, jidNormalizedUser, fetchLatestBaileysVersion,
+  Browsers, jidNormalizedUser, fetchLatestBaileysVersion, BufferJSON,
 } = require('@whiskeysockets/baileys');
 const QRCode = require('qrcode');
 const { MSG_CACHE_PER_USER, DATA_DIR } = require('./config');
@@ -113,6 +113,7 @@ class Session {
     this.contacts = this.loadJson('contacts.json'); // names YOU saved in your phone, synced from WhatsApp
     this.lidMap = this.loadLidMap(); // WhatsApp hides numbers behind "LID" ids; this maps them back to phone numbers
     this.stats = ud.loadStats(uid); // all-time counts, kept in stats.json so they survive restarts
+    this.viewOnces = this.loadViewOnces(); // latest view-once per person, for ".vv <number>" 
   }
 
   /** Text messages survive restarts, so an edit/delete right after a restart can still be recovered. */
@@ -138,6 +139,38 @@ class Session {
       const p = require('path').join(ud.userDir(this.uid), 'textcache.json');
       fs.writeFileSync(p + '.tmp', JSON.stringify(rows.slice(-TEXT_CACHE_MAX))); fs.renameSync(p + '.tmp', p);
     } catch {}
+  }
+
+  // ---------- latest view-once per person (for ".vv <number>") ----------
+  // Kept in vonce.json (with the media download keys) so it survives restarts. 14 days, 300 people max.
+  loadViewOnces() {
+    try {
+      const rows = JSON.parse(fs.readFileSync(require('path').join(ud.userDir(this.uid), 'vonce.json'), 'utf8'), BufferJSON.reviver);
+      const cutoff = Date.now() - 14 * 864e5;
+      return new Map(rows.filter(([, v]) => v.t > cutoff));
+    } catch { return new Map(); }
+  }
+  noteViewOnce(id, entry) {
+    const who = entry.senderPn || this.toPn(entry.sender) || jidNormalizedUser(entry.sender);
+    this.viewOnces.delete(who); // re-insert so the newest is last
+    this.viewOnces.set(who, { id, chatId: entry.chatId, sender: entry.sender, senderPn: entry.senderPn, pushName: entry.pushName, t: entry.t, message: entry.message, file: null });
+    while (this.viewOnces.size > 300) this.viewOnces.delete(this.viewOnces.keys().next().value);
+    clearTimeout(this.voSave);
+    this.voSave = setTimeout(() => {
+      try {
+        const p = require('path').join(ud.userDir(this.uid), 'vonce.json');
+        fs.writeFileSync(p + '.tmp', JSON.stringify([...this.viewOnces], BufferJSON.replacer)); fs.renameSync(p + '.tmp', p);
+      } catch (e) { this.log('warn', `Couldn't save the view-once list: ${e.message}`); }
+    }, 3000);
+    this.voSave.unref?.();
+  }
+  /** The latest view-once from a phone number (also matches people WhatsApp shows by hidden ID). */
+  latestViewOnce(pnJid) {
+    let best = this.viewOnces.get(pnJid) || null;
+    for (const [k, v] of this.viewOnces) {
+      if (k !== pnJid && (this.toPn(k) === pnJid || this.toPn(v.sender) === pnJid) && (!best || v.t > best.t)) best = v;
+    }
+    return best;
   }
 
   /** Add to a recovery count and save it to disk shortly after. */
@@ -457,6 +490,13 @@ class Session {
     if (m.editedMessage?.message?.protocolMessage) return this.onProtocol(msg, chatId, m.editedMessage.message.protocolMessage);
 
     if (msg.key.fromMe) return; // don't cache or recover your own messages
+
+    // every view-once is noted (whatever your recovery settings), so ".vv <number>" can fetch it later
+    if (isViewOnce(m) && !isStatus) {
+      const alt = [msg.key.participantPn, msg.key.senderPn, msg.key.participantAlt, msg.key.remoteJidAlt].find((j) => j && j.endsWith('@s.whatsapp.net'));
+      const sender = msg.key.participant || chatId;
+      this.noteViewOnce(msg.key.id, { message: m, chatId, sender, senderPn: !sender.endsWith('@g.us') && alt ? alt : undefined, pushName: msg.pushName, t: tsMs(msg) || Date.now() });
+    }
     const cfg = ud.effective(this.uid, chatId);
     if (!cfg.enabled || (isStatus && !cfg.statusDeleted && !cfg.statusEdited)) return;
 
@@ -476,6 +516,7 @@ class Session {
         const file = await media.saveAhead(this.uid, msg, this.sock);
         if (file) {
           entry.file = file;
+          const vo = this.viewOnces.get(entry.senderPn || this.toPn(entry.sender) || jidNormalizedUser(entry.sender)); if (vo?.id === msg.key.id) vo.file = file;
           await this.sendFile(this.selfJid(), part, file, `👁️ *View-once ${part.type}*\nFrom: ${this.who(entry)}\nChat: ${await this.chatLabel(chatId)}`);
           this.bump('viewOnce');
           this.log('info', `Saved a view-once ${part.type} from ${this.who(entry)}`);
@@ -622,6 +663,31 @@ class Session {
     return { caption: lines.join('\n'), mentions };
   }
 
+  /** .vv <number>: send that person's latest view-once to your own chat. */
+  async vvLatest(pnJid) {
+    const toSelf = (t) => this.sock.sendMessage(this.selfJid(), { text: t });
+    const vo = this.latestViewOnce(pnJid);
+    const who = this.person(pnJid, vo?.pushName);
+    if (!vo) return toSelf(`👁️ No view-once from ${who} in the last 14 days.\n\n_The bot only knows ones that arrived while it was connected._`);
+    const ago = left(Date.now() - vo.t);
+    const part = media.mediaPart(vo.message);
+    if (!part) {
+      return toSelf(`👁️ ${who} sent a view-once ${ago} ago in ${await this.chatLabel(vo.chatId)}, but WhatsApp didn't give the bot the photo/video itself.\n\nOpen that chat and reply *.vv* to it (before opening it) - that way works.`);
+    }
+    let file = vo.file && fs.existsSync(vo.file) ? vo.file : null;
+    let temp = false;
+    if (!file) {
+      try { file = await media.downloadToFile(this.uid, part.node, part.key, vo.id, this.sock); temp = true; }
+      catch (e) { return toSelf(`⚠️ Found ${who}'s view-once from ${ago} ago, but it couldn't be downloaded (${e.message}). It may have expired. Try replying *.vv* to it in the chat.`); }
+    }
+    try {
+      const { caption } = await this.viewOnceCaption(part, { senderJid: vo.senderPn || vo.sender, cached: vo, chatId: vo.chatId, inChat: false });
+      await this.sendFile(this.selfJid(), part, file, caption);
+      this.bump('vv');
+      this.log('info', `.vv ${num(pnJid)} sent their latest view-once ${part.type} to you`);
+    } finally { if (temp) fs.unlink(file, () => {}); }
+  }
+
   // ---------- .block / .unblock (real WhatsApp block, optionally for a set time) ----------
   async blockCommand(cmd, msg, chatId, args) {
     const sub = (args[0] || '').toLowerCase();
@@ -739,8 +805,12 @@ class Session {
       if (cmd === '.vv' || cmd === '.vvc') {
         const ctx = msg.message.extendedTextMessage?.contextInfo;
         const part = ctx?.quotedMessage ? media.mediaPart(ctx.quotedMessage) : null;
-        if (!part || !['image', 'video', 'audio'].includes(part.type)) {
-          await toSelf('Reply to a view-once photo, video or voice note with .vv (to you) or .vvc (in that chat). Tip: reply *before* opening it.');
+        const digits = args.join('').replace(/\D/g, '');
+        if (!ctx?.quotedMessage && cmd === '.vv' && (digits.length >= 8 || (!chatId.endsWith('@g.us') && !this.isSelf(chatId) && chatId !== 'status@broadcast'))) {
+          // .vv <number>  (or .vv in their private chat): fetch their latest view-once
+          await this.vvLatest(digits.length >= 8 ? `${digits}@s.whatsapp.net` : (this.toPn(chatId) || jidNormalizedUser(chatId)));
+        } else if (!part || !['image', 'video', 'audio'].includes(part.type)) {
+          await toSelf('Reply to a view-once photo, video or voice note with .vv (to you) or .vvc (in that chat). Tip: reply *before* opening it.\n\nOr send *.vv +2348012345678* from here to get that person\'s latest view-once.');
         } else {
           const file = await media.downloadToFile(this.uid, part.node, part.key, ctx.stanzaId, this.sock);
           const cached = this.cache.get(ctx.stanzaId);
@@ -819,7 +889,8 @@ class Session {
           '_Send these yourself, in any chat._\n\n' +
           '*👁️ View-once*\n' +
           '• *.vv*  reply to a view-once and it comes here\n' +
-          '• *.vvc*  reply to a view-once and it is posted in that chat\n\n' +
+          '• *.vvc*  reply to a view-once and it is posted in that chat\n' +
+          '• *.vv 2348012345678*  their latest view-once comes here (or just *.vv* in your chat with them)\n\n' +
           '*⚙️ Settings for one chat*\n' +
           '• *.ad status*  see this chat\'s settings\n' +
           '• *.ad on* / *.ad off*  turn recovery on or off here\n' +
