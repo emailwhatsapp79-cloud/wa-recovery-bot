@@ -557,7 +557,7 @@ function dashboard(user) {
   <div class="group"><h2>Recovered so far</h2><div class="stat-grid four" id="stats"></div></div>
   <div class="group"><h2>Commands you can send in WhatsApp</h2><div class="card" style="padding:4px 18px">
     <div class="cmd-row"><code>.vv</code><span>Reply to a view-once. It comes to your own chat.</span></div>
-    <div class="cmd-row"><code>.vv +234…</code><span>That person's latest view-once comes to your own chat, without opening their chat.</span></div>
+    <div class="cmd-row"><code>.vv +234…</code><span>Tells you when and where that person last sent you a view-once. To get the photo itself, reply <b>.vv</b> to it (WhatsApp only gives it through your phone).</span></div>
     <div class="cmd-row"><code>.vvc</code><span>Reply to a view-once. It's posted back in that chat.</span></div>
     <div class="cmd-row"><code>.transcribe</code><span>Reply to a voice note. Its text comes to your own chat.</span></div>
     <div class="cmd-row"><code>.block 2h</code><span>Reply to someone. Blocked on WhatsApp, unblocked by itself after 2h (30m, 1d, 1w…). <b>.unblock</b> ends it early.</span></div>

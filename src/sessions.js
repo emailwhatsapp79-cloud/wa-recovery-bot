@@ -459,6 +459,15 @@ class Session {
   // ---------- incoming messages ----------
   async onMessage(msg) {
     if (!msg.key?.id) return;
+    // WhatsApp never gives linked devices the view-once itself: only an empty "view-once" notice.
+    // Note who sent it and where, so ".vv <number>" can point you to it (reply .vv to it on your phone).
+    if (!msg.message && msg.key.isViewOnce && !msg.key.fromMe && msg.key.remoteJid !== 'status@broadcast') {
+      this.learnFromKey(msg.key, msg.pushName);
+      const chatId = msg.key.remoteJid, sender = msg.key.participant || chatId;
+      const alt = [msg.key.participantPn, msg.key.senderPn, msg.key.participantAlt, msg.key.remoteJidAlt].find((j) => j && j.endsWith('@s.whatsapp.net'));
+      this.noteViewOnce(msg.key.id, { message: {}, chatId, sender, senderPn: !sender.endsWith('@g.us') && alt ? alt : undefined, pushName: msg.pushName, t: tsMs(msg) || Date.now() });
+      return;
+    }
     if (!msg.message) {
       if (msg.messageStubType === 2) { // CIPHERTEXT = WhatsApp sent it but we couldn't decrypt it
         const who = msg.key.fromMe ? 'your own phone' : this.person(msg.key.participant || msg.key.remoteJid);
@@ -672,7 +681,7 @@ class Session {
     const ago = left(Date.now() - vo.t);
     const part = media.mediaPart(vo.message);
     if (!part) {
-      return toSelf(`👁️ ${who} sent a view-once ${ago} ago in ${await this.chatLabel(vo.chatId)}, but WhatsApp didn't give the bot the photo/video itself.\n\nOpen that chat and reply *.vv* to it (before opening it) - that way works.`);
+      return toSelf(`👁️ *${who}* sent you a view-once ${ago} ago\nChat: ${await this.chatLabel(vo.chatId)}\nSent: ${when(vo.t)}\n\nWhatsApp doesn't give view-once photos to linked devices, so the bot can't fetch it by number.\n👉 Open that chat on your phone and reply *.vv* to it (before opening it) - that works.`);
     }
     let file = vo.file && fs.existsSync(vo.file) ? vo.file : null;
     let temp = false;
@@ -890,7 +899,7 @@ class Session {
           '*👁️ View-once*\n' +
           '• *.vv*  reply to a view-once and it comes here\n' +
           '• *.vvc*  reply to a view-once and it is posted in that chat\n' +
-          '• *.vv 2348012345678*  their latest view-once comes here (or just *.vv* in your chat with them)\n\n' +
+          '• *.vv 2348012345678*  when and where they last sent you a view-once\n\n' +
           '*⚙️ Settings for one chat*\n' +
           '• *.ad status*  see this chat\'s settings\n' +
           '• *.ad on* / *.ad off*  turn recovery on or off here\n' +

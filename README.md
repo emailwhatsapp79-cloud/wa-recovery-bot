@@ -32,7 +32,7 @@ All data lives in `data/` (back it up; never share it — it contains WhatsApp l
 Rollback: `pm2 delete wa-multi` then start the old bot again (its folder is untouched).
 
 ## Commands (each user, in WhatsApp)
-`.vv` (reply to view-once → to you; `.vv +234…` = that person's latest view-once) · `.vvc` (→ into that chat) · `.ping` · `.help` ·
+`.vv` (reply to view-once → to you; `.vv +234…` = when/where that person last sent you a view-once (WhatsApp hides the media itself from linked devices)) · `.vvc` (→ into that chat) · `.ping` · `.help` ·
 `.ad status` · `.ad on|off [type]` · `.ad reset` ·
 `.block [30m|2h|1d|1w]` (blocks on WhatsApp, unblocks by itself when the time is up; reply to someone, send it in their chat, or add a number) · `.unblock` · `.block list` ·
 `.admins message` (in a group: posts it with only the admins tagged) ·
