@@ -495,8 +495,22 @@ class Session {
     }
 
     // 2) edits and deletes arrive as protocol messages
+    // debug: capture any upsert that carries edit/protocol shapes
+    if (!msg.key.fromMe && (m.editedMessage || m.protocolMessage)) {
+      this.dbg('UPS', {
+        chat: (chatId || '').slice(-18),
+        mKeys: Object.keys(m),
+        protoType: m.protocolMessage?.type ?? m.editedMessage?.message?.protocolMessage?.type ?? null,
+        edKeys: m.editedMessage?.message ? Object.keys(m.editedMessage.message) : null,
+      });
+    }
     if (m.protocolMessage) return this.onProtocol(msg, chatId, m.protocolMessage);
     if (m.editedMessage?.message?.protocolMessage) return this.onProtocol(msg, chatId, m.editedMessage.message.protocolMessage);
+    // edit delivered as a bare editedMessage wrapper (no protocolMessage inside)
+    if (!msg.key.fromMe && m.editedMessage?.message && !m.editedMessage.message.protocolMessage) {
+      const alt = [msg.key.participantPn, msg.key.senderPn, msg.key.participantAlt, msg.key.remoteJidAlt].find((j) => j && j.endsWith('@s.whatsapp.net'));
+      return this.recoverEdit(chatId, msg.key.id, m.editedMessage.message, { sender: msg.key.participant || chatId, pushName: msg.pushName, alt });
+    }
 
     if (msg.key.fromMe) return; // don't cache or recover your own messages
 
@@ -558,15 +572,50 @@ class Session {
     if (p.type === 0 || p.type === undefined || p.type === null) return this.recoverDelete(chatId, targetId);
   }
 
+  // Temporary debug: append a compact shape of edit/delete-ish events to data/edit-debug.log
+  dbg(tag, obj) {
+    try {
+      const p = require('path').join(ud.userDir(this.uid), 'edit-debug.log');
+      let n = 0; try { n = fs.readFileSync(p, 'utf8').split('\n').length; } catch {}
+      if (n > 400) return; // cap
+      fs.appendFileSync(p, new Date().toISOString().slice(11, 19) + ' ' + tag + ' ' + JSON.stringify(obj) + '\n');
+    } catch {}
+  }
+
   async onUpdate({ key, update }) {
     this.learnFromKey(key);
-    if (!key?.id || key.fromMe) return;
-    const edited = update?.message?.editedMessage?.message?.protocolMessage?.editedMessage ||
-      update?.message?.protocolMessage?.editedMessage || update?.message?.editedMessage?.message;
+    if (!key?.id) return;
+    // debug: what does an update actually look like?
+    if (!key.fromMe && (update?.message !== undefined || update?.messageStubType)) {
+      const m = update?.message;
+      this.dbg('UPD', {
+        chat: (key.remoteJid || '').slice(-18), fromMe: !!key.fromMe, stub: update?.messageStubType ?? null,
+        msgNull: m === null, mKeys: m ? Object.keys(m) : null,
+        edKeys: m?.editedMessage?.message ? Object.keys(m.editedMessage.message) : null,
+        protoType: m?.protocolMessage?.type ?? m?.editedMessage?.message?.protocolMessage?.type ?? null,
+      });
+    }
+    if (key.fromMe) return;
+    const edited = this.extractEdited(update?.message);
     if (edited) return this.recoverEdit(key.remoteJid, key.id, edited, { sender: key.participant || key.remoteJid });
     if (update?.message === null || update?.messageStubType === 1 || update?.messageStubType === 68) {
       return this.recoverDelete(key.remoteJid, key.id);
     }
+  }
+
+  /** Pull the new edited content out of any known Baileys shape, or null. */
+  extractEdited(container) {
+    if (!container) return null;
+    // Baileys 7 messages.update edit: message.editedMessage.message = <new content>
+    const direct = container.editedMessage?.message;
+    if (direct && !direct.protocolMessage) return direct;
+    // protocolMessage MESSAGE_EDIT in any nesting
+    const p = container.protocolMessage ||
+      container.editedMessage?.message?.protocolMessage ||
+      container.ephemeralMessage?.message?.protocolMessage ||
+      container.editedMessage?.message?.ephemeralMessage?.message?.protocolMessage;
+    if (p && (p.type === 14 || p.editedMessage)) return p.editedMessage || null;
+    return null;
   }
 
   who(entry) { return this.person(entry.senderPn || entry.sender, entry.pushName); }
